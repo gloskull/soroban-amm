@@ -971,7 +971,7 @@ impl Staking {
 
         // #699: drop from the staker index once fully unstaked, so the index
         // stays bounded by currently-active stakers.
-        if new_staked == 0 {
+        if new_staked == 0 && unpaid_pending == 0 {
             Self::_index_remove(&env, &staker);
         }
 
@@ -1177,18 +1177,23 @@ impl Staking {
     pub fn pending_rewards(env: Env, staker: Address) -> i128 {
         Self::extend_instance_ttl(&env);
         let effective = Self::_staker_effective(&env, &staker);
-        if effective == 0 {
-            return 0;
-        }
-        let acc_per_share: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AccumulatedRewardsPerShare)
-            .unwrap_or(0);
         let rewards_debt: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::StakerRewardsDebt(staker))
+            .unwrap_or(0);
+
+        // A full exit while paused carries earned rewards in a negative debt.
+        // With no effective stake there is no accumulator-based component,
+        // but that carried amount must remain claimable.
+        if effective == 0 {
+            return (-rewards_debt).max(0);
+        }
+
+        let acc_per_share: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedRewardsPerShare)
             .unwrap_or(0);
         (effective * acc_per_share / SCALE_FACTOR - rewards_debt).max(0)
     }
@@ -1710,16 +1715,19 @@ impl Staking {
                 .persistent()
                 .get(&DataKey::StakerAmount(staker.clone()))
                 .unwrap_or(0);
+            let rewards_debt: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakerRewardsDebt(staker.clone()))
+                .unwrap_or(0);
             let credited = if raw > 0 {
                 let effective = Self::_staker_effective(&env, &staker);
-                let rewards_debt: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::StakerRewardsDebt(staker.clone()))
-                    .unwrap_or(0);
                 (effective * acc_per_share / SCALE_FACTOR - rewards_debt).max(0)
             } else {
-                0
+                // Fully exited stakers can remain indexed while they hold
+                // paused rewards in negative debt. Include that liability in
+                // reconciliation instead of reclassifying it as undistributed.
+                (-rewards_debt).max(0)
             };
             let state_key = DataKey::ReconcileState(staker.clone());
             let previous: Option<(u32, i128)> = env.storage().persistent().get(&state_key);
@@ -1919,6 +1927,18 @@ impl Staking {
             .extend_ttl(&key_debt, MIN_TTL, BUMP_TO);
 
         SepTokenClient::new(env, &reward_token).transfer(&pool_addr, staker, &pending);
+
+        // A zero-balance staker is retained in the registry only while a
+        // paused unstake has carried unpaid rewards. Remove that temporary
+        // entry once the carried amount has been claimed.
+        let raw: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerAmount(staker.clone()))
+            .unwrap_or(0);
+        if raw == 0 {
+            Self::_index_remove(env, staker);
+        }
 
         // #1045: paying a claim decrements only the owed side. The
         // undistributed counter was already debited when the rewards were
@@ -2898,6 +2918,64 @@ mod tests {
             reward_client.balance(&staker),
             balance_before_pause + claimed
         );
+    }
+
+    /// A full exit during a pause must preserve accrued rewards even though
+    /// the staker no longer has an LP position.
+    #[test]
+    fn full_unstake_while_paused_keeps_rewards_claimable() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &100_i128);
+        let pending_before = staking.pending_rewards(&staker);
+        assert!(pending_before > 0);
+
+        let reward_token = staking.get_pool_info().reward_token;
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+        let balance_before = reward_client.balance(&staker);
+        let owed_before = staking.get_owed_rewards();
+
+        staking.pause(&admin);
+        let (lp_returned, rewards_returned) = staking.unstake(&staker, &1_000_i128);
+        assert_eq!(lp_returned, 1_000);
+        assert_eq!(rewards_returned, 0);
+        assert_eq!(staking.get_staker_info(&staker).staked_amount, 0);
+        assert_eq!(staking.pending_rewards(&staker), pending_before);
+        assert_eq!(reward_client.balance(&staker), balance_before);
+
+        staking.unpause(&admin);
+        assert_eq!(staking.claim(&staker), pending_before);
+        assert_eq!(reward_client.balance(&staker), balance_before + pending_before);
+        assert_eq!(staking.get_owed_rewards(), owed_before - pending_before);
+        assert_eq!(staking.pending_rewards(&staker), 0);
+    }
+
+    /// Reconciliation must count carried debt for a fully exited staker;
+    /// otherwise the liability would incorrectly become undistributed.
+    #[test]
+    fn reconcile_keeps_carried_rewards_owed_after_full_unstake_while_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &100_i128);
+        let carried = staking.pending_rewards(&staker);
+        assert!(carried > 0);
+
+        staking.pause(&admin);
+        staking.unstake(&staker, &1_000_i128);
+        assert_eq!(staking.pending_rewards(&staker), carried);
+
+        let (undistributed, owed) =
+            staking.reconcile_reward_accounting(&admin, &0, &50, &true);
+        assert_eq!(owed, carried);
+        assert_eq!(undistributed, 0);
+        assert_eq!(staking.get_owed_rewards(), carried);
+        assert_eq!(staking.pending_rewards(&staker), carried);
     }
 
     /// Regression test for #560: extend_lock() must be halted entirely while
